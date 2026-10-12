@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gzip
+import io
 import os
 from pathlib import Path
 from typing import Annotated, Any
@@ -59,6 +61,23 @@ async def _read_upload(file: UploadFile) -> tuple[bytes, str]:
 def _dataset_error(exc: DatasetError) -> HTTPException:
     return HTTPException(status_code=422, detail=str(exc))
 
+MAX_DECOMPRESSED_UPLOAD_BYTES = 80 * 1024 * 1024
+
+
+def _decompress_csv_if_needed(contents: bytes, filename: str) -> tuple[bytes, str]:
+    """Expand gzip-compressed CSV uploads with a hard decompressed-size limit."""
+    if not filename.lower().endswith(".csv.gz"):
+        return contents, filename
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(contents), mode="rb") as stream:
+            expanded = stream.read(MAX_DECOMPRESSED_UPLOAD_BYTES + 1)
+    except (OSError, EOFError) as exc:
+        raise DatasetError("The compressed CSV is invalid or incomplete.") from exc
+    if len(expanded) > MAX_DECOMPRESSED_UPLOAD_BYTES:
+        raise DatasetError("The compressed CSV exceeds the 80 MiB processing limit.")
+    return expanded, filename[:-3]
+
+
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
@@ -114,6 +133,64 @@ async def analyze(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Unexpected model-processing error ({type(exc).__name__}). Check backend logs.") from exc
 
+
+MAX_DYNAMIC_TRAIN_ROWS = 200_000
+
+
+@app.post("/api/analyze-smart")
+async def analyze_smart(
+    file: Annotated[
+        UploadFile,
+        File(description="Labelled customer churn data"),
+    ],
+    target_column: Annotated[str | None, Form()] = None,
+    positive_label: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Analyse labelled data without replacing the shared production model."""
+    contents, filename = await _read_upload(file)
+
+    try:
+        contents, filename = _decompress_csv_if_needed(contents, filename)
+        df = read_dataset(contents, filename)
+
+        if len(df) > MAX_DYNAMIC_TRAIN_ROWS:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"This demo accepts up to "
+                    f"{MAX_DYNAMIC_TRAIN_ROWS:,} rows per request."
+                ),
+            )
+
+        result, _ = analyse_labeled_dataset(
+            df,
+            target_column=target_column or None,
+            positive_label=positive_label or None,
+            save_model=False,
+        )
+
+        result["dataset"]["name"] = filename
+        result["model_saved"] = False
+        result["analysis_mode"] = "dataset_specific"
+        result["notes"].append(
+            "Results belong to this uploaded dataset. "
+            "The shared production model was not replaced."
+        )
+
+        return result
+
+    except DatasetError as exc:
+        raise _dataset_error(exc) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Unexpected analysis error ({type(exc).__name__}). "
+                "Check backend logs."
+            ),
+        ) from exc
 
 @app.post("/api/train")
 async def train(

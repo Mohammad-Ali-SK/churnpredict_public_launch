@@ -20,12 +20,12 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.model_selection import StratifiedKFold, cross_val_predict, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-MAX_ROWS = 100_000
-MAX_COLUMNS = 200
+MAX_ROWS = 200_000
+MAX_COLUMNS = 100
 MAX_RETURNED_PREDICTIONS = 5_000
 
 TARGET_CANDIDATES = {
@@ -202,7 +202,7 @@ def build_pipeline(numeric_cols: list[str], categorical_cols: list[str], model_n
     if categorical_cols:
         categorical_pipe = Pipeline([
             ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore", min_frequency=2)),
+            ("onehot", OneHotEncoder(handle_unknown="ignore", min_frequency=2, max_categories=50)),
         ])
         transformers.append(("cat", categorical_pipe, categorical_cols))
     preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
@@ -309,6 +309,7 @@ def analyse_labeled_dataset(
     cleaned = df.loc[df[target].notna()].copy()
     if len(cleaned) < 10:
         raise DatasetError("At least 10 rows with a non-empty target label are required to evaluate a model.")
+
     positive_class, inference_method = infer_positive_class(cleaned[target], positive_label)
     y = (cleaned[target].astype(str) == str(positive_class)).astype(int).to_numpy()
     counts = np.bincount(y, minlength=2)
@@ -317,58 +318,123 @@ def analyse_labeled_dataset(
         raise DatasetError("The target needs at least 2 rows in each class. More labeled churn and retained examples are required.")
 
     X, numeric_cols, categorical_cols = prepare_features(cleaned, target)
-    y_series = pd.Series(y, index=X.index)
-    folds = min(5, minority_count)
-    cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
-    candidate_names = ["Logistic Regression", "Random Forest"]
+    large_mode = len(cleaned) > 10_000
+
+    if large_mode:
+        if minority_count < 5:
+            raise DatasetError("For datasets over 10,000 rows, at least 5 rows in each target class are required for holdout evaluation.")
+        train_indices, prediction_indices = train_test_split(
+            np.arange(len(X)),
+            test_size=0.20,
+            random_state=42,
+            stratify=y,
+        )
+        prediction_indices = np.sort(prediction_indices)
+        candidate_names = ["Logistic Regression"]
+        cv = None
+        folds = 1
+    else:
+        prediction_indices = np.arange(len(X))
+        train_indices = None
+        folds = min(5, minority_count)
+        cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
+        candidate_names = ["Logistic Regression", "Random Forest"]
+
     evaluated: list[dict[str, Any]] = []
     probabilities_by_model: dict[str, np.ndarray] = {}
+    pipelines_by_model: dict[str, Pipeline] = {}
 
     for model_name in candidate_names:
         pipeline = build_pipeline(numeric_cols, categorical_cols, model_name)
         try:
-            probabilities = cross_val_predict(pipeline, X, y_series, cv=cv, method="predict_proba", n_jobs=1)[:, 1]
-            metrics = _metrics(y, probabilities)
+            if large_mode:
+                assert train_indices is not None
+                pipeline.fit(X.iloc[train_indices], y[train_indices])
+                probabilities = pipeline.predict_proba(X.iloc[prediction_indices])[:, 1]
+                metrics = _metrics(y[prediction_indices], probabilities)
+            else:
+                assert cv is not None
+                probabilities = cross_val_predict(
+                    pipeline, X, y, cv=cv, method="predict_proba", n_jobs=1
+                )[:, 1]
+                metrics = _metrics(y, probabilities)
+                pipeline.fit(X, y)
+
             probabilities_by_model[model_name] = probabilities
+            pipelines_by_model[model_name] = pipeline
             evaluated.append({"model": model_name, **metrics})
         except Exception as exc:
-            # One candidate failing should not prevent the other model from running.
-            evaluated.append({"model": model_name, "error": f"Model could not be evaluated ({type(exc).__name__})."})
+            evaluated.append({
+                "model": model_name,
+                "error": f"Model could not be evaluated ({type(exc).__name__}).",
+            })
 
     valid = [item for item in evaluated if "roc_auc" in item]
     if not valid:
         raise DatasetError("The model could not be fitted to this dataset. Check for malformed or highly sparse columns.")
+
     best = max(valid, key=lambda item: (item["roc_auc"], item["f1"]))
     selected_model = best["model"]
-    oof_probabilities = probabilities_by_model[selected_model]
+    evaluation_probabilities = probabilities_by_model[selected_model]
+    evaluation = {key: value for key, value in best.items() if key != "model"}
 
-    final_pipeline = build_pipeline(numeric_cols, categorical_cols, selected_model)
-    final_pipeline.fit(X, y)
+    if large_mode and not save_model:
+        # For dataset-specific analysis, reuse the validation-trained model.
+        final_pipeline = pipelines_by_model[selected_model]
+    else:
+        # Small-data artifact training, or an explicitly requested saved model.
+        final_pipeline = build_pipeline(numeric_cols, categorical_cols, selected_model)
+        final_pipeline.fit(X, y)
+
     feature_importance = _feature_importance(final_pipeline, numeric_cols, categorical_cols)
 
-    # Use a stable identifier-like column for display when available, but never
-    # return the full uploaded customer records to the browser.
-    id_candidates = [c for c in cleaned.columns if _norm(c) in {"customerid", "customer_id", "accountid", "userid", "subscriberid", "id"}]
+    id_candidates = [
+        c for c in cleaned.columns
+        if _norm(c) in {"customerid", "customer_id", "accountid", "userid", "subscriberid", "id"}
+    ]
     id_col = id_candidates[0] if id_candidates else None
-    predictions: list[dict[str, Any]] = []
-    row_limit = min(len(cleaned), MAX_RETURNED_PREDICTIONS)
     ids = cleaned[id_col].tolist() if id_col else cleaned.index.tolist()
-    actual = y.tolist()
-    for idx in range(row_limit):
-        p = float(oof_probabilities[idx])
+
+    predictions: list[dict[str, Any]] = []
+    row_limit = min(len(prediction_indices), MAX_RETURNED_PREDICTIONS)
+    for position in range(row_limit):
+        idx = int(prediction_indices[position])
+        probability = float(evaluation_probabilities[position])
         predictions.append({
             "row_number": idx + 1,
             "customer_id": _safe_value(ids[idx]),
-            "churn_probability": round(p, 6),
-            "predicted_churn": bool(p >= 0.5),
-            "predicted_label": "Churn" if p >= 0.5 else "Retained",
-            "risk_level": _risk_level(p),
-            "actual_churn": int(actual[idx]),
+            "churn_probability": round(probability, 6),
+            "predicted_churn": bool(probability >= 0.5),
+            "predicted_label": "Churn" if probability >= 0.5 else "Retained",
+            "risk_level": _risk_level(probability),
+            "actual_churn": int(y[idx]),
         })
 
     missing_cells = int(cleaned.isna().sum().sum())
     duplicate_rows = int(cleaned.duplicated().sum())
     churn_count = int(y.sum())
+
+    if large_mode:
+        evaluation_description = (
+            "Evaluation metrics use a stratified 20% held-out validation set. "
+            "Returned predictions are for held-out rows only."
+        )
+        validation_info = {
+            "method": "Stratified train/test holdout",
+            "folds": 1,
+            "probabilities": "held-out validation",
+        }
+    else:
+        evaluation_description = (
+            "Evaluation metrics use out-of-fold predictions; each scored row was "
+            "held out from the model that produced its probability."
+        )
+        validation_info = {
+            "method": "StratifiedKFold",
+            "folds": folds,
+            "probabilities": "out-of-fold",
+        }
+
     result = {
         "status": "ok",
         "dataset": {
@@ -384,34 +450,42 @@ def analyse_labeled_dataset(
             "churn_count": churn_count,
             "retained_count": int(len(y) - churn_count),
             "churn_rate": round(100 * churn_count / len(y), 2),
-            "dropped_feature_columns": [],
             "feature_columns": X.columns.tolist(),
-            "dropped_feature_columns": [c for c in cleaned.columns if c != target and c not in X.columns],
+            "dropped_feature_columns": [
+                c for c in cleaned.columns if c != target and c not in X.columns
+            ],
         },
-        "evaluation": _metrics(y, oof_probabilities),
-        "cross_validation": {"method": "StratifiedKFold", "folds": folds, "probabilities": "out-of-fold"},
+        "evaluation": evaluation,
+        "cross_validation": validation_info,
         "model_comparison": evaluated,
         "selected_model": selected_model,
         "feature_importance": feature_importance,
         "predictions": predictions,
-        "predictions_truncated": len(cleaned) > row_limit,
+        "predictions_truncated": len(prediction_indices) > row_limit,
         "prediction_count_returned": row_limit,
         "notes": [
-            "Evaluation metrics use out-of-fold predictions; each scored row was held out from the model that produced its probability.",
+            evaluation_description,
             "Feature importance indicates predictive association, not causation.",
             "Positive class inference should be checked before relying on the churn labels.",
         ],
     }
+
+    negative_classes = [v for v in pd.unique(cleaned[target]) if str(v) != str(positive_class)]
+    if not negative_classes:
+        raise DatasetError("A negative target class could not be identified.")
+
     artifact = {
         "pipeline": final_pipeline,
         "model_name": selected_model,
         "target_column": target,
         "positive_class": str(positive_class),
-        "negative_class": str(next(v for v in pd.unique(cleaned[target]) if str(v) != str(positive_class))),
+        "negative_class": str(negative_classes[0]),
         "feature_columns": X.columns.tolist(),
         "numeric_columns": numeric_cols,
         "categorical_columns": categorical_cols,
-        "trained_rows": int(len(cleaned)),
+        "trained_rows": int(len(cleaned) if save_model else (
+            len(train_indices) if large_mode and train_indices is not None else len(cleaned)
+        )),
         "evaluation": result["evaluation"],
         "feature_importance": feature_importance,
     }
