@@ -3,15 +3,19 @@ from __future__ import annotations
 import gzip
 import io
 import os
+import tempfile
 from pathlib import Path
 from typing import Annotated, Any
 
 import joblib
+import threading
+import time
+from starlette.responses import JSONResponse
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from app.ml import DatasetError, analyse_labeled_dataset, predict_with_artifact, read_dataset
+from app.ml import DatasetError, analyse_csv_file, analyse_labeled_dataset, predict_with_artifact, read_dataset
 
 APP_DIR = Path(__file__).resolve().parent.parent
 MODEL_PATH = Path(os.getenv("MODEL_PATH", str(APP_DIR / "models" / "churn_model.joblib")))
@@ -24,6 +28,85 @@ app = FastAPI(
     version="1.0.0",
     description="Train and evaluate a churn classifier from labelled data, then score new customer rows.",
 )
+
+
+# --- CHURNPREDICT PUBLIC SMART-ANALYSIS SAFETY GUARD ---
+# One in-flight dataset analysis per process, plus a per-client rolling request limit.
+# Render's CF-Connecting-IP header is set at its Cloudflare edge; locally, this falls back
+# to the socket peer address. State is intentionally bounded for the Render Free one-process setup.
+_SMART_ANALYSIS_GUARD_LOCK = threading.Lock()
+_SMART_ANALYSIS_ACTIVE = False
+_SMART_ANALYSIS_REQUESTS: dict[str, list[float]] = {}
+_SMART_ANALYSIS_WINDOW_SECONDS = 600
+_SMART_ANALYSIS_MAX_REQUESTS_PER_WINDOW = 3
+_SMART_ANALYSIS_MAX_TRACKED_CLIENTS = 2000
+
+
+@app.middleware("http")
+async def _churnpredict_smart_analysis_safety_guard(request, call_next):
+    global _SMART_ANALYSIS_ACTIVE
+
+    if request.url.path != "/api/analyze-smart":
+        return await call_next(request)
+
+    # Render's current guidance is to read the first X-Forwarded-For address.
+    # Fall back to CF-Connecting-IP for other Cloudflare-proxied deployments,
+    # then to the socket peer for local development/tests.
+    forwarded_for = request.headers.get("x-forwarded-for", "").strip()
+    if forwarded_for:
+        client_ip = forwarded_for.split(",", 1)[0].strip()
+    else:
+        client_ip = request.headers.get("cf-connecting-ip", "").strip()
+        if not client_ip:
+            peer = request.client
+            client_ip = peer.host if peer else "unknown"
+    client_key = client_ip[:128]
+    now = time.monotonic()
+
+    with _SMART_ANALYSIS_GUARD_LOCK:
+        # Prune expired entries if the per-client table grows; keep memory bounded.
+        if len(_SMART_ANALYSIS_REQUESTS) >= _SMART_ANALYSIS_MAX_TRACKED_CLIENTS:
+            for key, timestamps in list(_SMART_ANALYSIS_REQUESTS.items()):
+                fresh = [t for t in timestamps if now - t < _SMART_ANALYSIS_WINDOW_SECONDS]
+                if fresh:
+                    _SMART_ANALYSIS_REQUESTS[key] = fresh
+                else:
+                    del _SMART_ANALYSIS_REQUESTS[key]
+            if (len(_SMART_ANALYSIS_REQUESTS) >= _SMART_ANALYSIS_MAX_TRACKED_CLIENTS
+                    and client_key not in _SMART_ANALYSIS_REQUESTS):
+                return JSONResponse(
+                    status_code=429,
+                    headers={"Retry-After": "600"},
+                    content={"detail": "The public analysis service is busy. Please try again later."},
+                )
+
+        if _SMART_ANALYSIS_ACTIVE:
+            return JSONResponse(
+                status_code=429,
+                headers={"Retry-After": "30"},
+                content={"detail": "Another dataset analysis is running. Please try again shortly."},
+            )
+
+        recent = [t for t in _SMART_ANALYSIS_REQUESTS.get(client_key, [])
+                  if now - t < _SMART_ANALYSIS_WINDOW_SECONDS]
+        if len(recent) >= _SMART_ANALYSIS_MAX_REQUESTS_PER_WINDOW:
+            retry_after = max(1, int(_SMART_ANALYSIS_WINDOW_SECONDS - (now - recent[0])))
+            return JSONResponse(
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+                content={"detail": "Analysis limit reached: at most 3 requests per 10 minutes. Please try later."},
+            )
+
+        recent.append(now)
+        _SMART_ANALYSIS_REQUESTS[client_key] = recent
+        _SMART_ANALYSIS_ACTIVE = True
+
+    try:
+        return await call_next(request)
+    finally:
+        with _SMART_ANALYSIS_GUARD_LOCK:
+            _SMART_ANALYSIS_ACTIVE = False
+# --- END CHURNPREDICT PUBLIC SMART-ANALYSIS SAFETY GUARD ---
 
 # Same-origin production deployment is used, but keep local development origins enabled.
 origins = [origin.strip() for origin in os.getenv(
@@ -61,7 +144,7 @@ async def _read_upload(file: UploadFile) -> tuple[bytes, str]:
 def _dataset_error(exc: DatasetError) -> HTTPException:
     return HTTPException(status_code=422, detail=str(exc))
 
-MAX_DECOMPRESSED_UPLOAD_BYTES = 80 * 1024 * 1024
+MAX_DECOMPRESSED_UPLOAD_BYTES = 25 * 1024 * 1024
 
 
 def _decompress_csv_if_needed(contents: bytes, filename: str) -> tuple[bytes, str]:
@@ -74,7 +157,7 @@ def _decompress_csv_if_needed(contents: bytes, filename: str) -> tuple[bytes, st
     except (OSError, EOFError) as exc:
         raise DatasetError("The compressed CSV is invalid or incomplete.") from exc
     if len(expanded) > MAX_DECOMPRESSED_UPLOAD_BYTES:
-        raise DatasetError("The compressed CSV exceeds the 80 MiB processing limit.")
+        raise DatasetError("The compressed CSV exceeds the 25 MiB Free-plan processing limit.")
     return expanded, filename[:-3]
 
 
@@ -151,23 +234,33 @@ async def analyze_smart(
 
     try:
         contents, filename = _decompress_csv_if_needed(contents, filename)
-        df = read_dataset(contents, filename)
-
-        if len(df) > MAX_DYNAMIC_TRAIN_ROWS:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    f"This demo accepts up to "
-                    f"{MAX_DYNAMIC_TRAIN_ROWS:,} rows per request."
-                ),
+        if filename.lower().endswith(".csv"):
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(prefix="churnpredict-", suffix=".csv", delete=False) as temp_file:
+                    temp_file.write(contents)
+                    temp_path = Path(temp_file.name)
+                result = analyse_csv_file(
+                    temp_path,
+                    target_column=target_column or None,
+                    positive_label=positive_label or None,
+                )
+            finally:
+                if temp_path is not None:
+                    temp_path.unlink(missing_ok=True)
+        else:
+            df = read_dataset(contents, filename)
+            if len(df) > MAX_DYNAMIC_TRAIN_ROWS:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(f"This demo accepts up to {MAX_DYNAMIC_TRAIN_ROWS:,} rows per request."),
+                )
+            result, _ = analyse_labeled_dataset(
+                df,
+                target_column=target_column or None,
+                positive_label=positive_label or None,
+                save_model=False,
             )
-
-        result, _ = analyse_labeled_dataset(
-            df,
-            target_column=target_column or None,
-            positive_label=positive_label or None,
-            save_model=False,
-        )
 
         result["dataset"]["name"] = filename
         result["model_saved"] = False

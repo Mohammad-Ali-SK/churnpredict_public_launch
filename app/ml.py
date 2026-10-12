@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import io
 import re
+import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -304,6 +306,7 @@ def analyse_labeled_dataset(
     target_column: str | None = None,
     positive_label: str | None = None,
     save_model: bool = False,
+    force_holdout: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     target = resolve_target(df, target_column)
     cleaned = df.loc[df[target].notna()].copy()
@@ -318,7 +321,7 @@ def analyse_labeled_dataset(
         raise DatasetError("The target needs at least 2 rows in each class. More labeled churn and retained examples are required.")
 
     X, numeric_cols, categorical_cols = prepare_features(cleaned, target)
-    large_mode = len(cleaned) > 10_000
+    large_mode = force_holdout or len(cleaned) > 10_000
 
     if large_mode:
         if minority_count < 5:
@@ -530,3 +533,259 @@ def predict_with_artifact(df: pd.DataFrame, artifact: dict[str, Any]) -> dict[st
         "prediction_count_returned": limit,
         "notes": ["Scores come from the trained model; predictive quality depends on the training data and evaluation metrics."],
     }
+
+# Free-plan CSV processing safeguards. Full-file profiling and scoring are chunked;
+# only a bounded stratified sample is retained for model fitting.
+MAX_STREAM_SAMPLE_ROWS = 5_000
+MAX_STREAM_CHUNK_ROWS = 2_000
+MAX_STREAM_PREDICTIONS = 1_000
+
+
+def analyse_csv_file(
+    path: str | Path,
+    target_column: str | None = None,
+    positive_label: str | None = None,
+) -> dict[str, Any]:
+    """Analyse a CSV in bounded chunks, train on a stratified sample, and score all labelled rows.
+
+    Evaluation metrics are calculated on a holdout from the training sample. Full-dataset
+    summary counts and risk-band counts are scanned separately and are not training metrics.
+    """
+    csv_path = Path(path)
+    try:
+        header_frame = pd.read_csv(csv_path, nrows=0, dtype="string")
+    except Exception as exc:
+        raise DatasetError(f"Could not read CSV header ({type(exc).__name__}).") from exc
+
+    columns = [str(c).strip() or f"unnamed_column_{i + 1}" for i, c in enumerate(header_frame.columns)]
+    if not columns:
+        raise DatasetError("The CSV has no columns.")
+    if len(columns) > MAX_COLUMNS:
+        raise DatasetError(f"This backend supports up to {MAX_COLUMNS} columns per request.")
+    if len(set(columns)) != len(columns):
+        raise DatasetError("Column names must be unique after trimming whitespace.")
+
+    skeleton = pd.DataFrame(columns=columns)
+    target = resolve_target(skeleton, target_column or None)
+    target_index = columns.index(target)
+    random_gen = random.Random(42)
+
+    non_null_any = {c: 0 for c in columns}
+    missing_by_col = {c: 0 for c in columns}
+    class_counts: dict[str, int] = {}
+    class_order: list[str] = []
+    class_reservoirs: dict[str, pd.DataFrame] = {}
+    class_seen: dict[str, int] = {}
+    seen_hashes: set[int] = set()
+    duplicate_rows = 0
+    total_nonblank_rows = 0
+    labelled_rows = 0
+    priority_col = "__churnpredict_sample_priority__"
+    while priority_col in columns:
+        priority_col += "_"
+
+    try:
+        reader = pd.read_csv(csv_path, chunksize=MAX_STREAM_CHUNK_ROWS, dtype="string")
+        for chunk in reader:
+            if len(chunk.columns) != len(columns):
+                raise DatasetError("CSV column count changed while reading the file.")
+            chunk.columns = columns
+            chunk = chunk.replace(r"^\s*$", pd.NA, regex=True)
+            total_nonblank_rows += int(chunk.notna().any(axis=1).sum())
+            if total_nonblank_rows > MAX_ROWS:
+                raise DatasetError(f"This backend supports up to {MAX_ROWS:,} data rows per request.")
+
+            non_null_counts = chunk.notna().sum()
+            for col, count in non_null_counts.items():
+                non_null_any[col] += int(count)
+
+            labelled = chunk.loc[chunk[target].notna()]
+            if labelled.empty:
+                continue
+            labelled_rows += len(labelled)
+            for col, count in labelled.isna().sum().items():
+                missing_by_col[col] += int(count)
+
+            hashes = pd.util.hash_pandas_object(labelled, index=False).to_numpy()
+            for value in hashes:
+                hv = int(value)
+                if hv in seen_hashes:
+                    duplicate_rows += 1
+                else:
+                    seen_hashes.add(hv)
+
+            labels = labelled[target].astype(str)
+            value_counts = labels.value_counts(dropna=False)
+            for label, count in value_counts.items():
+                label = str(label)
+                if label not in class_counts:
+                    class_order.append(label)
+                    class_counts[label] = 0
+                    class_seen[label] = 0
+                    class_reservoirs[label] = pd.DataFrame(columns=columns + [priority_col])
+                class_counts[label] += int(count)
+                if len(class_order) > 2:
+                    raise DatasetError("Large-file analysis on the Free plan requires a binary churn target (two classes).")
+
+            # Vectorised random priorities let us keep at most 5,000 candidate rows per class.
+            priorities = np.asarray([random_gen.random() for _ in range(len(labelled))], dtype=float)
+            label_values = labels.to_numpy(dtype=str)
+            for label in labels.unique().tolist():
+                mask = label_values == str(label)
+                subset = labelled.loc[mask].copy()
+                subset[priority_col] = priorities[mask]
+                class_seen[str(label)] += len(subset)
+                existing = class_reservoirs[str(label)]
+                combined = (
+                    subset.copy()
+                    if existing.empty
+                    else pd.concat([existing, subset], ignore_index=True)
+                )
+                if len(combined) > MAX_STREAM_SAMPLE_ROWS:
+                    combined = combined.nsmallest(MAX_STREAM_SAMPLE_ROWS, priority_col)
+                class_reservoirs[str(label)] = combined
+    except DatasetError:
+        raise
+    except Exception as exc:
+        raise DatasetError(f"Could not process CSV in chunks ({type(exc).__name__}).") from exc
+
+    if total_nonblank_rows == 0:
+        raise DatasetError("The uploaded CSV contains no data rows.")
+    if labelled_rows < 10:
+        raise DatasetError("At least 10 rows with a non-empty target label are required to evaluate a model.")
+    if len(class_order) != 2:
+        raise DatasetError("Large-file analysis requires exactly two target classes, such as Yes/No or 1/0.")
+
+    positive_class, inference_method = infer_positive_class(pd.Series(class_order, dtype="string"), positive_label)
+    positive_key = str(positive_class)
+    if positive_key not in class_counts:
+        raise DatasetError("The selected positive label does not match a target value in the CSV.")
+    positive_count = int(class_counts[positive_key])
+    negative_count = int(labelled_rows - positive_count)
+    if min(positive_count, negative_count) < 5 and total_nonblank_rows > MAX_STREAM_SAMPLE_ROWS:
+        raise DatasetError("For large CSVs, at least 5 labelled rows in each target class are required.")
+
+    usable_columns = [c for c in columns if non_null_any[c] > 0]
+    full_missing_cells = int(sum(missing_by_col[c] for c in usable_columns))
+    target_classes = class_order[:]
+
+    # Small files keep their original full-data cross-validation behavior.
+    if total_nonblank_rows <= MAX_STREAM_SAMPLE_ROWS:
+        try:
+            df = read_dataset(csv_path.read_bytes(), csv_path.name)
+        except Exception as exc:
+            if isinstance(exc, DatasetError):
+                raise
+            raise DatasetError(f"Could not read CSV ({type(exc).__name__}).") from exc
+        result, _ = analyse_labeled_dataset(df, target, positive_label, save_model=False)
+        return result
+
+    sample_size = min(MAX_STREAM_SAMPLE_ROWS, labelled_rows)
+    positive_quota = int(round(sample_size * positive_count / labelled_rows))
+    positive_quota = max(5, min(sample_size - 5, positive_quota))
+    quotas = {positive_key: positive_quota}
+    negative_key = next(k for k in class_order if k != positive_key)
+    quotas[negative_key] = sample_size - positive_quota
+
+    selected_rows: list[dict[str, Any]] = []
+    for label in class_order:
+        reservoir = class_reservoirs[label]
+        quota = quotas[label]
+        if len(reservoir) < quota:
+            raise DatasetError("Could not create a sufficiently representative training sample from this CSV.")
+        chosen = reservoir.nsmallest(quota, priority_col).drop(columns=[priority_col])
+        selected_rows.extend(chosen.to_dict(orient="records"))
+
+    sample_raw = pd.DataFrame(selected_rows, columns=columns)
+    sample_bytes = sample_raw.to_csv(index=False).encode("utf-8")
+    sample_df = read_dataset(sample_bytes, "churnpredict_training_sample.csv")
+    result, artifact = analyse_labeled_dataset(
+        sample_df,
+        target_column=target,
+        positive_label=positive_key,
+        save_model=True,
+        force_holdout=True,
+    )
+    if artifact is None:
+        raise DatasetError("The sampled model artifact was not created.")
+
+    pipeline: Pipeline = artifact["pipeline"]
+    feature_columns = list(artifact["feature_columns"])
+    numeric_columns = set(artifact["numeric_columns"])
+    id_candidates = [c for c in columns if _norm(c) in {"customerid", "accountid", "userid", "subscriberid", "id", "rowid", "recordid"}]
+    id_col = id_candidates[0] if id_candidates else None
+
+    risk_counts = {"high": 0, "medium": 0, "low": 0, "predicted_churn": 0, "total": 0}
+    full_predictions: list[dict[str, Any]] = []
+    source_offset = 0
+    try:
+        reader = pd.read_csv(csv_path, chunksize=MAX_STREAM_CHUNK_ROWS, dtype="string")
+        for chunk in reader:
+            chunk.columns = columns
+            chunk = chunk.replace(r"^\s*$", pd.NA, regex=True)
+            labelled = chunk.loc[chunk[target].notna()]
+            if not labelled.empty:
+                X = pd.DataFrame(index=labelled.index)
+                for col in feature_columns:
+                    if col in numeric_columns:
+                        numeric = pd.to_numeric(labelled[col], errors="coerce")
+                        X[col] = numeric.to_numpy(dtype=np.float64, na_value=np.nan)
+                    else:
+                        categorical = labelled[col].astype(object)
+                        X[col] = categorical.where(pd.notna(categorical), np.nan)
+                X = X.replace([np.inf, -np.inf], np.nan)
+                probs = pipeline.predict_proba(X)[:, 1]
+                target_values = labelled[target].astype(str).tolist()
+                ids = labelled[id_col].tolist() if id_col else list(range(source_offset + 1, source_offset + len(chunk) + 1))
+                row_positions = np.flatnonzero(chunk[target].notna().to_numpy())
+                for local_idx, probability in enumerate(probs):
+                    probability = float(probability)
+                    risk = _risk_level(probability)
+                    risk_counts[{"High": "high", "Medium": "medium", "Low": "low"}[risk]] += 1
+                    risk_counts["predicted_churn"] += int(probability >= 0.5)
+                    risk_counts["total"] += 1
+                    if len(full_predictions) < MAX_STREAM_PREDICTIONS:
+                        original_row_number = source_offset + int(row_positions[local_idx]) + 1
+                        customer_id = _safe_value(ids[local_idx])
+                        full_predictions.append({
+                            "row_number": original_row_number,
+                            "customer_id": customer_id,
+                            "churn_probability": round(probability, 6),
+                            "predicted_churn": bool(probability >= 0.5),
+                            "predicted_label": "Churn" if probability >= 0.5 else "Retained",
+                            "risk_level": risk,
+                            "actual_churn": int(target_values[local_idx] == positive_key),
+                        })
+            source_offset += len(chunk)
+    except Exception as exc:
+        if isinstance(exc, DatasetError):
+            raise
+        raise DatasetError(f"Could not score the full CSV in chunks ({type(exc).__name__}).") from exc
+
+    dataset = result["dataset"]
+    dataset.update({
+        "name": csv_path.name,
+        "rows": int(labelled_rows),
+        "columns": int(len(usable_columns)),
+        "target_column": target,
+        "target_classes": target_classes,
+        "positive_class": positive_key,
+        "positive_class_inference": inference_method,
+        "missing_cells": full_missing_cells,
+        "duplicate_rows": int(duplicate_rows),
+        "churn_count": positive_count,
+        "retained_count": negative_count,
+        "churn_rate": round(100 * positive_count / labelled_rows, 2),
+    })
+    result["predictions"] = full_predictions
+    result["predictions_truncated"] = labelled_rows > len(full_predictions)
+    result["prediction_count_returned"] = len(full_predictions)
+    result["risk_summary"] = risk_counts
+    result["cross_validation"]["training_sample_rows"] = int(sample_size)
+    result["cross_validation"]["full_dataset_rows"] = int(labelled_rows)
+    result["notes"] = list(result.get("notes", [])) + [
+        f"The classifier was trained on a stratified sample of {sample_size:,} labelled rows. Evaluation metrics come from the sample's held-out validation split, not from all rows.",
+        f"Risk-band counts and the first {len(full_predictions):,} detailed predictions were computed by scoring all {labelled_rows:,} labelled rows in chunks.",
+        "Feature importance indicates predictive association, not causation.",
+    ]
+    return result
