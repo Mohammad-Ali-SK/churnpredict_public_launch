@@ -46,20 +46,17 @@ _SMART_ANALYSIS_MAX_TRACKED_CLIENTS = 2000
 async def _churnpredict_smart_analysis_safety_guard(request, call_next):
     global _SMART_ANALYSIS_ACTIVE
 
-    if request.url.path != "/api/analyze-smart":
+    if request.method != "POST" or request.url.path != "/api/analyze-smart":
         return await call_next(request)
 
-    # Render's current guidance is to read the first X-Forwarded-For address.
-    # Fall back to CF-Connecting-IP for other Cloudflare-proxied deployments,
-    # then to the socket peer for local development/tests.
-    forwarded_for = request.headers.get("x-forwarded-for", "").strip()
-    if forwarded_for:
-        client_ip = forwarded_for.split(",", 1)[0].strip()
-    else:
-        client_ip = request.headers.get("cf-connecting-ip", "").strip()
-        if not client_ip:
-            peer = request.client
-            client_ip = peer.host if peer else "unknown"
+    # On Render, Cloudflare sets CF-Connecting-IP on inbound requests. Prefer this
+    # trusted edge header; do not trust the leftmost X-Forwarded-For value because
+    # callers may be able to supply that header themselves. Local tests fall back
+    # to the direct socket peer address.
+    client_ip = request.headers.get("cf-connecting-ip", "").strip()
+    if not client_ip:
+        peer = request.client
+        client_ip = peer.host if peer else "unknown"
     client_key = client_ip[:128]
     now = time.monotonic()
 
@@ -133,11 +130,16 @@ def _load_artifact() -> dict[str, Any] | None:
 
 async def _read_upload(file: UploadFile) -> tuple[bytes, str]:
     filename = file.filename or "upload.csv"
-    content = await file.read()
+    # Read at most the configured limit plus one byte, so oversized uploads are
+    # rejected without copying the entire uploaded file into application memory.
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File is too large. Maximum upload size is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+        )
     if not content:
         raise HTTPException(status_code=400, detail="The uploaded file is empty.")
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail=f"File is too large. Maximum upload size is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.")
     return content, filename
 
 
