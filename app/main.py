@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import gzip
+import io
 import os
+import tempfile
 from pathlib import Path
 from typing import Annotated, Any
 
 import joblib
+import threading
+import time
+from starlette.responses import JSONResponse
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from app.ml import DatasetError, analyse_labeled_dataset, predict_with_artifact, read_dataset
+from app.ml import DatasetError, analyse_csv_file, analyse_labeled_dataset, predict_with_artifact, read_dataset
 
 APP_DIR = Path(__file__).resolve().parent.parent
 MODEL_PATH = Path(os.getenv("MODEL_PATH", str(APP_DIR / "models" / "churn_model.joblib")))
@@ -22,6 +28,82 @@ app = FastAPI(
     version="1.0.0",
     description="Train and evaluate a churn classifier from labelled data, then score new customer rows.",
 )
+
+
+# --- CHURNPREDICT PUBLIC SMART-ANALYSIS SAFETY GUARD ---
+# One in-flight dataset analysis per process, plus a per-client rolling request limit.
+# Render's CF-Connecting-IP header is set at its Cloudflare edge; locally, this falls back
+# to the socket peer address. State is intentionally bounded for the Render Free one-process setup.
+_SMART_ANALYSIS_GUARD_LOCK = threading.Lock()
+_SMART_ANALYSIS_ACTIVE = False
+_SMART_ANALYSIS_REQUESTS: dict[str, list[float]] = {}
+_SMART_ANALYSIS_WINDOW_SECONDS = 600
+_SMART_ANALYSIS_MAX_REQUESTS_PER_WINDOW = 3
+_SMART_ANALYSIS_MAX_TRACKED_CLIENTS = 2000
+
+
+@app.middleware("http")
+async def _churnpredict_smart_analysis_safety_guard(request, call_next):
+    global _SMART_ANALYSIS_ACTIVE
+
+    if request.method != "POST" or request.url.path != "/api/analyze-smart":
+        return await call_next(request)
+
+    # On Render, Cloudflare sets CF-Connecting-IP on inbound requests. Prefer this
+    # trusted edge header; do not trust the leftmost X-Forwarded-For value because
+    # callers may be able to supply that header themselves. Local tests fall back
+    # to the direct socket peer address.
+    client_ip = request.headers.get("cf-connecting-ip", "").strip()
+    if not client_ip:
+        peer = request.client
+        client_ip = peer.host if peer else "unknown"
+    client_key = client_ip[:128]
+    now = time.monotonic()
+
+    with _SMART_ANALYSIS_GUARD_LOCK:
+        # Prune expired entries if the per-client table grows; keep memory bounded.
+        if len(_SMART_ANALYSIS_REQUESTS) >= _SMART_ANALYSIS_MAX_TRACKED_CLIENTS:
+            for key, timestamps in list(_SMART_ANALYSIS_REQUESTS.items()):
+                fresh = [t for t in timestamps if now - t < _SMART_ANALYSIS_WINDOW_SECONDS]
+                if fresh:
+                    _SMART_ANALYSIS_REQUESTS[key] = fresh
+                else:
+                    del _SMART_ANALYSIS_REQUESTS[key]
+            if (len(_SMART_ANALYSIS_REQUESTS) >= _SMART_ANALYSIS_MAX_TRACKED_CLIENTS
+                    and client_key not in _SMART_ANALYSIS_REQUESTS):
+                return JSONResponse(
+                    status_code=429,
+                    headers={"Retry-After": "600"},
+                    content={"detail": "The public analysis service is busy. Please try again later."},
+                )
+
+        if _SMART_ANALYSIS_ACTIVE:
+            return JSONResponse(
+                status_code=429,
+                headers={"Retry-After": "30"},
+                content={"detail": "Another dataset analysis is running. Please try again shortly."},
+            )
+
+        recent = [t for t in _SMART_ANALYSIS_REQUESTS.get(client_key, [])
+                  if now - t < _SMART_ANALYSIS_WINDOW_SECONDS]
+        if len(recent) >= _SMART_ANALYSIS_MAX_REQUESTS_PER_WINDOW:
+            retry_after = max(1, int(_SMART_ANALYSIS_WINDOW_SECONDS - (now - recent[0])))
+            return JSONResponse(
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+                content={"detail": "Analysis limit reached: at most 3 requests per 10 minutes. Please try later."},
+            )
+
+        recent.append(now)
+        _SMART_ANALYSIS_REQUESTS[client_key] = recent
+        _SMART_ANALYSIS_ACTIVE = True
+
+    try:
+        return await call_next(request)
+    finally:
+        with _SMART_ANALYSIS_GUARD_LOCK:
+            _SMART_ANALYSIS_ACTIVE = False
+# --- END CHURNPREDICT PUBLIC SMART-ANALYSIS SAFETY GUARD ---
 
 # Same-origin production deployment is used, but keep local development origins enabled.
 origins = [origin.strip() for origin in os.getenv(
@@ -48,16 +130,38 @@ def _load_artifact() -> dict[str, Any] | None:
 
 async def _read_upload(file: UploadFile) -> tuple[bytes, str]:
     filename = file.filename or "upload.csv"
-    content = await file.read()
+    # Read at most the configured limit plus one byte, so oversized uploads are
+    # rejected without copying the entire uploaded file into application memory.
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File is too large. Maximum upload size is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+        )
     if not content:
         raise HTTPException(status_code=400, detail="The uploaded file is empty.")
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail=f"File is too large. Maximum upload size is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.")
     return content, filename
 
 
 def _dataset_error(exc: DatasetError) -> HTTPException:
     return HTTPException(status_code=422, detail=str(exc))
+
+MAX_DECOMPRESSED_UPLOAD_BYTES = 25 * 1024 * 1024
+
+
+def _decompress_csv_if_needed(contents: bytes, filename: str) -> tuple[bytes, str]:
+    """Expand gzip-compressed CSV uploads with a hard decompressed-size limit."""
+    if not filename.lower().endswith(".csv.gz"):
+        return contents, filename
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(contents), mode="rb") as stream:
+            expanded = stream.read(MAX_DECOMPRESSED_UPLOAD_BYTES + 1)
+    except (OSError, EOFError) as exc:
+        raise DatasetError("The compressed CSV is invalid or incomplete.") from exc
+    if len(expanded) > MAX_DECOMPRESSED_UPLOAD_BYTES:
+        raise DatasetError("The compressed CSV exceeds the 25 MiB Free-plan processing limit.")
+    return expanded, filename[:-3]
+
 
 
 @app.get("/api/health")
@@ -165,6 +269,74 @@ async def analyze_smart(
             detail=f"Unexpected analysis error ({type(exc).__name__}). Check backend logs.",
         ) from exc
 
+
+MAX_DYNAMIC_TRAIN_ROWS = 200_000
+
+
+@app.post("/api/analyze-smart")
+async def analyze_smart(
+    file: Annotated[
+        UploadFile,
+        File(description="Labelled customer churn data"),
+    ],
+    target_column: Annotated[str | None, Form()] = None,
+    positive_label: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Analyse labelled data without replacing the shared production model."""
+    contents, filename = await _read_upload(file)
+
+    try:
+        contents, filename = _decompress_csv_if_needed(contents, filename)
+        if filename.lower().endswith(".csv"):
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(prefix="churnpredict-", suffix=".csv", delete=False) as temp_file:
+                    temp_file.write(contents)
+                    temp_path = Path(temp_file.name)
+                result = analyse_csv_file(
+                    temp_path,
+                    target_column=target_column or None,
+                    positive_label=positive_label or None,
+                )
+            finally:
+                if temp_path is not None:
+                    temp_path.unlink(missing_ok=True)
+        else:
+            df = read_dataset(contents, filename)
+            if len(df) > MAX_DYNAMIC_TRAIN_ROWS:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(f"This demo accepts up to {MAX_DYNAMIC_TRAIN_ROWS:,} rows per request."),
+                )
+            result, _ = analyse_labeled_dataset(
+                df,
+                target_column=target_column or None,
+                positive_label=positive_label or None,
+                save_model=False,
+            )
+
+        result["dataset"]["name"] = filename
+        result["model_saved"] = False
+        result["analysis_mode"] = "dataset_specific"
+        result["notes"].append(
+            "Results belong to this uploaded dataset. "
+            "The shared production model was not replaced."
+        )
+
+        return result
+
+    except DatasetError as exc:
+        raise _dataset_error(exc) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Unexpected analysis error ({type(exc).__name__}). "
+                "Check backend logs."
+            ),
+        ) from exc
 
 @app.post("/api/train")
 async def train(
