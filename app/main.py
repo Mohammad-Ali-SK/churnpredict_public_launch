@@ -114,6 +114,57 @@ async def analyze(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Unexpected model-processing error ({type(exc).__name__}). Check backend logs.") from exc
 
+MAX_DYNAMIC_TRAIN_ROWS = 10_000
+
+
+@app.post("/api/analyze-smart")
+async def analyze_smart(
+    file: Annotated[UploadFile, File(description="Labelled customer churn data")],
+    target_column: Annotated[str | None, Form()] = None,
+    positive_label: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    """Analyse a labelled dataset without overwriting the shared production model."""
+    contents, filename = await _read_upload(file)
+
+    try:
+        df = read_dataset(contents, filename)
+
+        if len(df) > MAX_DYNAMIC_TRAIN_ROWS:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"This public demo accepts up to "
+                    f"{MAX_DYNAMIC_TRAIN_ROWS:,} rows per training request."
+                ),
+            )
+
+        result, _ = analyse_labeled_dataset(
+            df,
+            target_column=target_column or None,
+            positive_label=positive_label or None,
+            save_model=False,
+        )
+
+        result["dataset"]["name"] = filename
+        result["model_saved"] = False
+        result["analysis_mode"] = "dataset_specific"
+        result["notes"].append(
+            "This analysis belongs to this upload only. "
+            "The shared production model was not replaced."
+        )
+
+        return result
+
+    except DatasetError as exc:
+        raise _dataset_error(exc) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected analysis error ({type(exc).__name__}). Check backend logs.",
+        ) from exc
+
 
 @app.post("/api/train")
 async def train(
